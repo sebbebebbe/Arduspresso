@@ -5,7 +5,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-char ver[] = "v1.1"; 
+char ver[] = "v1.6"; 
 
 //Ultrasonic sensor
 #define TRIGGER_PIN  8  // Arduino pin tied to trigger pin on the ultrasonic sensor.
@@ -24,7 +24,7 @@ NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
  * LCD Enable pin to digital pin 11
  * LCD D4 pin to digital pin 5
  * LCD D5 pin to digital pin 4
- * LCD D6 pin to digital pin 3
+ * LCD D6 pin to digital pin 3  
  * LCD D7 pin to digital pin 2
  * LCD R/W pin to ground
  * LCD V0/3 pin to pin 6 (contrast)
@@ -47,20 +47,20 @@ const char bigDigitsTop[10][digitWidth]={ 3,0,3, 0,3,32, 2,2,3, 0,2,3, 3,1,3, 3,
 const char bigDigitsBot[10][ digitWidth]={ 3,1,3, 1,3,1,  3,1,1, 1,1,3, 32,32,3, 1,1,3, 3,1,3, 32,32,3, 3,1,3, 1,1,3};
 char buffer[12]; // used to convert a number into a string 
 int screenPowerPin = 10;
-int screenTimerSeconds = 30; //this is the time to countdown inorder to keep the screen active
+int screenTimerSeconds = 5; //this is the time to countdown inorder to keep the screen active
 boolean writeDroplet = true;
 
 //brewtimer
 int secondsBrewed = 1;
-int brewTimerSeconds = 0; //this is the countdown timer we use to keep the bretimer running
-int brewEnergySamplesOverThreshold = 0; //determines how many current samples we have gathered before we determine if the pump is running
+bool pumpIsOn = false;
 EnergyMonitor brewMonitor; // with 18ohms burden
 int brewMonitorPin = 1;
-int falseSamples = 0; //if we have received energy samples below the threshold then we determine that the pump has stopped
+double pumpIrms;
 
 //boilerStatus
 EnergyMonitor boilerMonitor; // with 18ohms burden
 int boilerMonitorPin = 2;
+double boilerIrms;
 
 //boilerTemp
 int oneWirePin = 7;
@@ -74,13 +74,17 @@ TimedAction ultrasonicSensorAction = TimedAction(5000,runUltrasonicSensor);
 TimedAction energyMonitorAction = TimedAction(300, monitorEnergy); 
 TimedAction brewTimerAction = TimedAction(1000, brewTimer);
 TimedAction displayTimerAction = TimedAction(1000, displayTimerCountdown);
+TimedAction boilerMonitorAction = TimedAction(1000, checkBoiler);
+TimedAction brewMonitorAction = TimedAction(1000, checkPump);
 
 void setup() {
     setupLCD();
     Serial.begin(9600);
     sensors.begin();    
+    
     brewMonitor.current(brewMonitorPin, 111.11);
     boilerMonitor.current(boilerMonitorPin, 111.11);
+    
     pinMode(screenPowerPin, OUTPUT);
     runUltrasonicSensor(); //lets get an inital waterlevel reading
   }
@@ -131,55 +135,63 @@ void showNumber(int value, int position, int shiftdown) {
 } 
 
 void loop() {
+
   energyMonitorAction.check();
   brewTimerAction.check();
   printLCDDataAction.check();
   displayTimerAction.check();
   ultrasonicSensorAction.check();
+  boilerMonitorAction.check();
+  brewMonitorAction.check();
   
   boilerTemperature = getTemp();
+ 
+  //sendSensorData();
+}
+
+void sendSensorData()
+{
+  Serial.print("BoilerMonitor Irms: ");
+  Serial.println(boilerIrms);
+  
+  Serial.print("Pump Irms: ");
+  Serial.println(pumpIrms);
+  
+  delay(200);
+}
+
+void checkPump()
+{
+  pumpIrms = brewMonitor.calcIrms(1480);
+}
+
+void checkBoiler()
+{
+   boilerIrms = boilerMonitor.calcIrms(1480);
 }
 
 void monitorEnergy()
 { 
-  //I need to move the CT-sensor inorder for this to ever work
-  double IrmsBrewMonitor = brewMonitor.calcIrms(1480);
-  
-  //Serial.print("Pump:");
-  //Serial.print(" ");
-  //Serial.println(IrmsBrewMonitor*230.0);
-  if((IrmsBrewMonitor*230.0) > 125)
-  {
-     brewEnergySamplesOverThreshold++;
-     
-     if(brewEnergySamplesOverThreshold > 2)
-     {
-       brewTimerSeconds = 5;
-       brewEnergySamplesOverThreshold = 0;
-     }
+  if(pumpIrms > 0.60 && boilerTemperature > 100) 
+  {  
+       pumpIsOn = true;  
   }
   else
   {
-    //false samples
-    falseSamples++;
-    if(falseSamples > 4)
-    {
-      brewEnergySamplesOverThreshold = 0;
-      brewTimerSeconds = 0;
-      falseSamples = 0;
-    }
-    
+       pumpIsOn = false;
   }
-  
-  delay(200);
-  
-  double IrmsBoilerMonitor = boilerMonitor.calcIrms(1480);
-  //Serial.print("Boiler: ");
-  //Serial.print(" ");
-  //Serial.println(IrmsBoilerMonitor*230.0);
-  if((IrmsBoilerMonitor*230.0) > 300)
+ 
+  //&& boilerTemperature > 50
+  if(boilerIrms > 2)
   {
-     screenTimerSeconds = 45; //gives the screen 45 seconds of activity
+    if(boilerTemperature > 100)
+    {
+     screenTimerSeconds = 45; //gives the screen more seconds of activity
+    }
+    else
+    {
+      screenTimerSeconds = 20;
+    }
   }
 }
 
@@ -193,7 +205,7 @@ void printLCDData()
   else
   {
     lcd.clear();
-    showNumber( floor(boilerTemperature), 0, 0);
+    showNumber(boilerTemperature, 0, 0);
   
     if(writeDroplet)
     { 
@@ -230,20 +242,13 @@ void displayTimerCountdown()
 
 void brewTimer()
 {
-  if(brewTimerSeconds > 0)
+  if(pumpIsOn)
   {
-    brewTimerSeconds--;
-    Serial.print("SecondsBrewed: ");
-    Serial.print(brewTimerSeconds);
-  }
-  
-  if(brewTimerSeconds < 1)
-  {
-     secondsBrewed = 0;
+     secondsBrewed += 1;
   }
   else
   {
-     secondsBrewed += 1;
+    secondsBrewed = 0;
   }
   
   if(secondsBrewed >= 99)
